@@ -1,0 +1,23 @@
+services:
+  cyberhunt:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - HUNT_DATA_DIR=/app/data
+      - HUNT_HTTPS=${HUNT_HTTPS:-0}
+      - HUNT_CAPACITY=120
+    volumes:
+      - hunt_storage:/app/data
+      - ./organizer/competition-pack:/app/import:ro
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 256
+    mem_limit: 1g
+
+volumes:
+  hunt_storage:
