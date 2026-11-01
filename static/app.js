@@ -18,3 +18,20 @@ async function reloadAdmin(){
 }
 if(document.getElementById('leaderboard')){reloadScores();setInterval(reloadScores,5000)}
 if(document.getElementById('admin-metrics')){reloadAdmin();setInterval(reloadAdmin,3000)}
+
+const uploadButton=document.getElementById('upload-button');
+if(uploadButton){uploadButton.addEventListener('click',async()=>{
+ const fileInput=document.getElementById('upload-file'),status=document.getElementById('upload-status');
+ const file=fileInput.files?.[0];
+ if(!file){status.textContent='Select a file first.';return;}
+ if(file.size>3000000){status.textContent='The file exceeds 3 MB.';return;}
+ uploadButton.disabled=true;status.textContent='Uploading evidence…';
+ try{
+  const dataUrl=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('File read failed'));reader.readAsDataURL(file);});
+  const csrf=document.querySelector('input[name="_csrf"]')?.value;
+  const r=await fetch('/admin/upload',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({name:file.name,data:String(dataUrl).split(',',2)[1]})});
+  if(!r.ok)throw Error(`Upload failed (${r.status})`);
+  const result=await r.json();document.getElementById('asset_name').value=result.asset_name;
+  status.textContent=`Uploaded ${file.name} (${result.bytes} bytes). Save the challenge to attach it.`;
+ }catch(e){status.textContent=String(e.message||e);}finally{uploadButton.disabled=false;}
+});}

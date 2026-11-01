@@ -1,5 +1,5 @@
 """Real HTTP functional checks with temporary SQLite storage (stdlib)."""
-import contextlib, http.cookiejar, json, os, re, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.error, urllib.parse, urllib.request
+import contextlib, base64, http.cookiejar, json, os, re, shutil, socket, subprocess, sys, tempfile, time, unittest, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -90,6 +90,18 @@ class SystemTests(unittest.TestCase):
   req=urllib.request.Request(u.base+'/logout',data=b'',method='POST')
   with self.assertRaises(urllib.error.HTTPError) as resp:u.open.open(req)
   self.assertEqual(resp.exception.code,403)
+  # Organizer can upload an artifact and bind it to a new challenge.
+  _,editor,_=admin.get('/admin/challenge/new')
+  token=re.search(r'name="_csrf" value="([a-f0-9]+)"',editor).group(1)
+  payload=json.dumps({'name':'organizer_note.txt','data':base64.b64encode(b'Only an organizer can upload this.').decode()}).encode()
+  req=urllib.request.Request(admin.base+'/admin/upload',data=payload,method='POST',headers={'Content-Type':'application/json','X-CSRF-Token':token})
+  with admin.open.open(req) as resp:uploaded=json.loads(resp.read())['asset_name']
+  self.assertTrue(uploaded.endswith('organizer_note.txt'))
+  code,body,_=admin.post('/admin/challenge/new',{'slug':'custom-mission','title':'Custom Mission','category':'Cryptography','description':'An original admin-created challenge.','points':'200','sort_order':'99','flag_mode':'static','flag':'HUNT{CUSTOM_ANSWER}','asset_name':uploaded,'published':'on'})
+  self.assertEqual(code,200)
+  code,body,_=admin.post('/admin/challenges/bulk',{'action':'publish'})
+  self.assertEqual(code,200)
+  self.assertIn('21 configured',body)
   code,body,_=admin.get('/admin/export.csv');self.assertEqual(code,200);self.assertIn('hunter_01',body)
   with u.open.open(u.base+'/asset/1/01_station.png') as resp:
    self.assertEqual(resp.status,200);self.assertTrue(resp.read(8).startswith(b'\x89PNG'))

@@ -10,7 +10,7 @@ A self-hosted cybersecurity competition system designed for ~100 second-/third-y
 - 20 original challenges: 9 steganography, 7 cryptography, 3 isolated web puzzles, 1 final multi-stage hunt
 - 17 original media/file artifacts (PNG, WAV, ZIP and TXT)
 - Individual scoreboard with 5-second refresh; rank ties broken by last-solve time
-- Organizer dashboard: 3-second activity updates, publish/hide, edit/create challenges, event launch/pause, registration toggle, freeze/unfreeze scoreboard, CSV export
+- Organizer dashboard: 3-second activity updates, publish/hide individually or in bulk, edit/create challenges with direct file upload (3 MB max), event launch/pause, registration toggle, freeze/unfreeze scoreboard, CSV export
 - Static, SHA-256-verified flags and participant-specific HMAC-derived flags for three web challenges and the finale
 - Private answer key and challenge manifest in a **separate organizer package** (never upload it to public GitHub)
 - Docker Compose and native Windows/Linux starter scripts
@@ -22,7 +22,7 @@ A self-hosted cybersecurity competition system designed for ~100 second-/third-y
 3. In that folder, run `python setup_event.py` and choose a strong organizer password.
 4. Start with `python app.py serve` or double-click `start-windows.bat`.
 5. Visit **http://127.0.0.1:8000/login**, sign in as organizer, open **Mission control**.
-6. Preview/publish challenges, enable **Competition live**, and distribute the server URL to participants.
+6. Preview/publish challenges (or use **Publish all**), enable **Competition live**, and distribute the server URL to participants.
 
 Participants register via `/register`. View scoreboard at `/scoreboard`; the organizer panel is at `/admin`. The default participant capacity is 120; override with `HUNT_CAPACITY`.
 

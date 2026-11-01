@@ -173,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
    name=p.rsplit('/',1)[-1];ctype='text/css' if name.endswith('.css') else 'text/javascript'
    return self.respond(200,(STATIC/name).read_bytes(),ctype+'; charset=utf-8')
   self.s=self.session();self.user=self.s if self.s['user_id'] else None
+  if method=='POST' and p=='/admin/upload':return self.upload_asset()
   if method=='POST':
    try:form=self.parse_body()
    except (ValueError,UnicodeDecodeError):return self.error('Invalid form payload.',413)
@@ -195,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
   if p=='/admin' and method=='GET':return self.admin()
   if p=='/api/admin' and method=='GET':return self.api_admin()
   if p=='/admin/settings' and method=='POST':return self.admin_settings(form)
+  if p=='/admin/challenges/bulk' and method=='POST':return self.bulk_publish(form)
   if p=='/admin/challenge/new' and method=='GET':return self.challenge_edit(None)
   if p=='/admin/challenge/new' and method=='POST':return self.save_challenge(None,form)
   if re.fullmatch(r'/admin/challenge/\d+/edit',p):
@@ -321,7 +323,8 @@ class Handler(BaseHTTPRequestHandler):
   rows=''.join(f'<tr><td><strong>{esc(x["title"])}</strong><small>{esc(x["slug"])}</small></td><td>{esc(x["category"])}</td><td>{x["points"]}</td><td><span class="status {"on" if x["published"] else "off"}">{"LIVE" if x["published"] else "HIDDEN"}</span></td><td class="actioncells"><a class="small-button" href="/admin/challenge/{x["id"]}/edit">Edit</a>{csrf_form(f"/admin/challenge/{x['id']}/toggle",'',"Hide" if x['published'] else "Publish","inline")}</td></tr>' for x in challenges)
   event=setting(self.db,'event_live')=='1';reg=setting(self.db,'registration')=='1';frozen=setting(self.db,'scoreboard_frozen')=='1'
   settings=csrf_form('/admin/settings','<div class="settings-grid">'+''.join(f'<label class="toggle"><input type="checkbox" name="{k}" {"checked" if val else ""}><span>{title}</span></label>' for k,val,title in [('registration',reg,'Allow registration'),('event_live',event,'Competition live'),('scoreboard_frozen',frozen,'Freeze public leaderboard')])+'</div>'+txt('announcement','Public announcement',setting(self.db,'announcement'),2),'Apply event settings')
-  body=f'''<div class="page-heading"><div><span class="eyebrow">ORGANIZER ACCESS ONLY</span><h1>Mission control</h1><p>Publish challenges, control the event and observe activity.</p></div><div class="header-actions"><a class="button" href="/admin/challenge/new">+ Create challenge</a><a class="button ghost" href="/admin/export.csv">Export scores CSV</a></div></div>{card_stats([('Participants',u),('Challenges',c),('Verified solves',s),('Flag attempts',subs)])}<section class="admin-columns"><div class="panel"><h2>Event controls</h2><p class="muted">Keep competition closed until every puzzle has been tested.</p>{settings}</div><div class="panel"><h2>Activity monitor <span class="online">● LIVE</span></h2><p class="muted">Polling every three seconds.</p><div id="admin-metrics">Loading live data…</div><div id="admin-feed" class="feed"></div></div></section><div class="section-title flex-between"><div><span class="eyebrow">MISSION CATALOG</span><h2>Challenge inventory</h2></div><span class="muted">{len(challenges)} configured</span></div><div class="panel tablepanel"><table><thead><tr><th>CHALLENGE</th><th>DOMAIN</th><th>PTS</th><th>STATE</th><th>ACTIONS</th></tr></thead><tbody>{rows}</tbody></table></div>'''
+  bulk=csrf_form('/admin/challenges/bulk','<input type="hidden" name="action" value="publish">','Publish all','inline')+csrf_form('/admin/challenges/bulk','<input type="hidden" name="action" value="hide">','Hide all','inline')
+  body=f'''<div class="page-heading"><div><span class="eyebrow">ORGANIZER ACCESS ONLY</span><h1>Mission control</h1><p>Publish challenges, control the event and observe activity.</p></div><div class="header-actions"><a class="button" href="/admin/challenge/new">+ Create challenge</a><a class="button ghost" href="/admin/export.csv">Export scores CSV</a></div></div>{card_stats([('Participants',u),('Challenges',c),('Verified solves',s),('Flag attempts',subs)])}<section class="admin-columns"><div class="panel"><h2>Event controls</h2><p class="muted">Keep competition closed until every puzzle has been tested.</p>{settings}</div><div class="panel"><h2>Activity monitor <span class="online">● LIVE</span></h2><p class="muted">Polling every three seconds.</p><div id="admin-metrics">Loading live data…</div><div id="admin-feed" class="feed"></div></div></section><div class="section-title flex-between"><div><span class="eyebrow">MISSION CATALOG</span><h2>Challenge inventory</h2></div><div class="header-actions">{bulk}<span class="muted">{len(challenges)} configured</span></div></div><div class="panel tablepanel"><table><thead><tr><th>CHALLENGE</th><th>DOMAIN</th><th>PTS</th><th>STATE</th><th>ACTIONS</th></tr></thead><tbody>{rows}</tbody></table></div>'''
   return self.html(200,'Mission control',body,'<script src="/static/app.js" defer></script>')
  def api_admin(self):
   if not self.require_auth(admin=True):return
@@ -343,8 +346,31 @@ class Handler(BaseHTTPRequestHandler):
   def v(k,default=''):return c[k] if c else default
   options=''.join(f'<option value="{esc(x)}" {"selected" if v("category")==x else ""}>{esc(x)}</option>' for x in CATEGORIES)
   options2=''.join(f'<option value="{x}" {"selected" if v("flag_mode","static")==x else ""}>{x}</option>' for x in ('static','dynamic'))
-  body=f'''<a class="back" href="/admin">← MISSION CONTROL</a><section class="panel editor"><div class="eyebrow">CHALLENGE CONFIGURATION</div><h1>{"Edit challenge" if cid else "New challenge"}</h1>{csrf_form('/admin/challenge/'+str(cid)+'/edit' if cid else '/admin/challenge/new',inp('slug','Unique slug',v('slug'),extra='required pattern="[a-z0-9-]{3,65}"')+inp('title','Title',v('title'),extra='required maxlength="120"')+'<label>Category<select name="category">'+options+'</select></label>'+txt('description','Instructions',v('description'),6)+inp('hint','Optional hint',v('hint'),extra='maxlength="500"')+inp('points','Points',v('points',100),'number','min="50" max="2000" required')+inp('sort_order','Display order',v('sort_order',1),'number')+'<label>Flag mode<select name="flag_mode">'+options2+'</select></label>'+inp('flag','Static flag (blank keeps existing)',type_='password',extra='' if cid else 'placeholder="HUNT{...}"')+inp('asset_name','Previously imported file name (optional)',v('asset_name'))+'<label class="toggle"><input type="checkbox" name="published" '+('checked' if v('published',0) else '')+'><span>Published</span></label>','Save challenge')}</section>'''
-  return self.html(200,'Challenge editor',body)
+  body=f'''<a class="back" href="/admin">← MISSION CONTROL</a><section class="panel editor"><div class="eyebrow">CHALLENGE CONFIGURATION</div><h1>{"Edit challenge" if cid else "New challenge"}</h1>{csrf_form('/admin/challenge/'+str(cid)+'/edit' if cid else '/admin/challenge/new',inp('slug','Unique slug',v('slug'),extra='required pattern="[a-z0-9-]{3,65}"')+inp('title','Title',v('title'),extra='required maxlength="120"')+'<label>Category<select name="category">'+options+'</select></label>'+txt('description','Instructions',v('description'),6)+inp('hint','Optional hint',v('hint'),extra='maxlength="500"')+inp('points','Points',v('points',100),'number','min="50" max="2000" required')+inp('sort_order','Display order',v('sort_order',1),'number')+'<label>Flag mode<select name="flag_mode">'+options2+'</select></label>'+inp('flag','Static flag (blank keeps existing)',type_='password',extra='' if cid else 'placeholder="HUNT{...}"')+inp('asset_name','Evidence file stored on server (upload below)',v('asset_name'),extra='id="asset_name" readonly')+'<div class="upload-tool"><label>Upload new evidence (PNG, JPG, WAV, MP3, TXT, ZIP, PDF, BIN; max 3 MB)<input type="file" id="upload-file" accept=".png,.jpg,.jpeg,.wav,.mp3,.txt,.zip,.pdf,.bin"></label><button type="button" id="upload-button" class="button ghost">Upload file</button><p id="upload-status" class="muted" role="status">Upload first, then save the challenge.</p></div><label class="toggle"><input type="checkbox" name="published" '+('checked' if v('published',0) else '')+'><span>Published</span></label>','Save challenge')}</section>'''
+  return self.html(200,'Challenge editor',body,'<script src="/static/app.js" defer></script>')
+ def upload_asset(self):
+  if not self.require_auth(admin=True):return
+  if self.headers.get('Content-Type','').split(';')[0].strip()!='application/json':return self.error('Expected JSON.',415)
+  try:
+   length=int(self.headers.get('Content-Length','0'))
+   if length<=0 or length>4_300_000:return self.error('Maximum upload is 3 MB.',413)
+   data=json.loads(self.rfile.read(length))
+   if not hmac.compare_digest(self.headers.get('X-CSRF-Token',''),self.s['csrf']):return self.error('CSRF token invalid.',403)
+   original=os.path.basename(str(data.get('name','')))
+   extension=Path(original).suffix.lower()
+   if not re.fullmatch(r'[A-Za-z0-9_.-]{1,120}',original) or extension not in {'.png','.jpg','.jpeg','.wav','.mp3','.txt','.zip','.pdf','.bin'}:return self.error('Invalid file name or type.',400)
+   raw=base64.b64decode(data.get('data',''),validate=True)
+   if len(raw)>3_000_000 or not raw:return self.error('File must be 1 byte to 3 MB.',413)
+   filename=secrets.token_hex(8)+'_'+original
+   (ASSETS/filename).write_bytes(raw)
+   return self.respond(200,json.dumps({'asset_name':filename,'bytes':len(raw)}),'application/json')
+  except (KeyError,ValueError,TypeError,json.JSONDecodeError):return self.error('Invalid upload payload.',400)
+ def bulk_publish(self,form):
+  if not self.require_auth(admin=True):return
+  action=form.get('action')
+  if action not in ('publish','hide'):return self.error('Invalid bulk action.',400)
+  self.db.execute('UPDATE challenges SET published=?',(int(action=='publish'),))
+  return self.go('/admin')
  def save_challenge(self,cid,form):
   if not self.require_auth(admin=True):return
   slug=form.get('slug','');title=form.get('title','').strip();cat=form.get('category','');desc=form.get('description','').strip();mode=form.get('flag_mode','static')
