@@ -1,4 +1,4 @@
-# Crypto Cyber Hunt · Release 1.0
+# Crypto Cyber Hunt · Release 1.2 (Windows coexistence fix)
 
 A self-hosted cybersecurity competition system designed for ~100 second-/third-year participants. **This is an independent application, not CTFd.** The web server requires only Python 3.10+ and the Python standard library. No subscription or third-party account is required.
 
@@ -20,8 +20,8 @@ A self-hosted cybersecurity competition system designed for ~100 second-/third-y
 1. Install Python 3.10 or newer (check with `python --version`).
 2. Extract the **complete organizer ZIP** into a private folder. Confirm `organizer/competition-pack/manifest.json` exists.
 3. In that folder, run `python setup_event.py` and choose a strong organizer password.
-4. Start with `python app.py serve` or double-click `start-windows.bat`.
-5. Visit **http://127.0.0.1:8000/login**, sign in as organizer, open **Mission control**.
+4. Start with `python start_hunt.py` or double-click `start-windows.bat`. The launcher binds to an automatically selected unused local port, checks that Crypto Cyber Hunt (not another service such as MON) responds, and opens the website.
+5. Use the exact URL printed by the launcher (the port changes each time). Sign in, then open **Mission control**. Do not use a guessed port or a chat link with a tracking query parameter.
 6. Preview/publish challenges (or use **Publish all**), enable **Competition live**, and distribute the server URL to participants.
 
 Participants register via `/register`. View scoreboard at `/scoreboard`; the organizer panel is at `/admin`. The default participant capacity is 120; override with `HUNT_CAPACITY`.
@@ -37,6 +37,12 @@ python app.py serve
 The project runs, but you must import a challenge package before publishing an event. Generate your own pack by running `python -m pip install Pillow` and then `python tools/build_challenges.py organizer/competition-pack`. Generated flags are unique to this generation; **never regenerate a pack mid-event**.
 
 Import a generated pack with `python app.py import-pack organizer/competition-pack`. Import defaults to hidden challenges. The private package contains `ORGANIZER_ANSWER_KEY.txt` and `manifest.json`, which must stay outside version control. A second import resets challenge publish state; use carefully.
+
+## Existing MON dashboard uses the chosen port?
+
+MON can continue running. Use `python start_hunt.py` to auto-select a free port. The browser should display Crypto Cyber Hunt, not MON. If the browser displays MON but the local launcher says both checks passed, verify the exact printed port using `curl.exe --noproxy "*" -i http://127.0.0.1:PORT/healthz` in a second PowerShell. Expected body: `OK`. Check browser proxy/extensions if curl identifies Crypto Cyber Hunt but the browser does not. Do not stop MON without identifying its actual process.
+
+**GitHub Pages cannot host the Python/SQLite login and scoreboard backend.** GitHub is for source code; deploy the working backend to a Windows/Linux server or a dynamic app host.
 
 ## Docker Compose
 
