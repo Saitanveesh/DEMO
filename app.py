@@ -64,6 +64,9 @@ def initialize():
  CREATE TABLE IF NOT EXISTS rounds(id INTEGER PRIMARY KEY,title TEXT NOT NULL,duration_minutes INTEGER NOT NULL,start_epoch INTEGER NOT NULL,end_epoch INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS round_challenges(round_id INTEGER NOT NULL REFERENCES rounds(id) ON DELETE CASCADE,challenge_id INTEGER NOT NULL REFERENCES challenges(id),PRIMARY KEY(round_id,challenge_id));
  CREATE INDEX IF NOT EXISTS idx_round_challenges_challenge ON round_challenges(challenge_id);
+ CREATE TABLE IF NOT EXISTS challenge_hints(challenge_id INTEGER NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,hint_index INTEGER NOT NULL CHECK(hint_index BETWEEN 1 AND 5),body TEXT NOT NULL,cost INTEGER NOT NULL DEFAULT 0 CHECK(cost>=0),PRIMARY KEY(challenge_id,hint_index));
+ CREATE TABLE IF NOT EXISTS hint_unlocks(user_id INTEGER NOT NULL REFERENCES users(id),challenge_id INTEGER NOT NULL REFERENCES challenges(id),hint_index INTEGER NOT NULL,cost_paid INTEGER NOT NULL CHECK(cost_paid>=0),created_at TEXT NOT NULL,created_epoch INTEGER NOT NULL,PRIMARY KEY(user_id,challenge_id,hint_index));
+ CREATE INDEX IF NOT EXISTS idx_hint_unlocks_user ON hint_unlocks(user_id,created_epoch);
  CREATE TABLE IF NOT EXISTS auth_attempts(id INTEGER PRIMARY KEY,ip TEXT NOT NULL,ts INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS idx_auth_ip_time ON auth_attempts(ip,ts);
  ''')
@@ -78,6 +81,22 @@ def initialize():
    name=f'{base[:40]}_{index}';index+=1
   db.execute('INSERT INTO teams(name,login_user_id,members_json,created_at) VALUES (?,?,?,?)',
              (name,user['id'],json.dumps([user['username']]),user['created_at']))
+ # Backward-compatible migration: first legacy hint remains free. No existing flags,
+ # accounts, solves, scoring or challenge publishing state are changed.
+ for challenge in db.execute('SELECT id,hint FROM challenges WHERE LENGTH(TRIM(hint))>0').fetchall():
+  db.execute('INSERT OR IGNORE INTO challenge_hints(challenge_id,hint_index,body,cost) VALUES (?,1,?,0)',(challenge['id'],challenge['hint']))
+ private_hints=ROOT/'organizer'/'hints_v3.json'
+ if private_hints.is_file() and setting(db,'hints_v3_seeded')!='1':
+  extra=json.loads(private_hints.read_text(encoding='utf8'))
+  for slug,entries in extra.items():
+   challenge=db.execute('SELECT id,points FROM challenges WHERE slug=?',(slug,)).fetchone()
+   if not challenge:continue
+   for idx,text in enumerate(entries,2):
+    if idx>5:break
+    cost=max(5,((challenge['points']*(10 if idx==2 else 20 if idx==3 else 25)+999)//1000)*10)
+    db.execute('INSERT OR IGNORE INTO challenge_hints(challenge_id,hint_index,body,cost) VALUES (?,?,?,?)',(challenge['id'],idx,str(text)[:650],cost))
+  if db.execute('SELECT COUNT(*) c FROM challenges').fetchone()['c']:
+   set_setting(db,'hints_v3_seeded','1')
  db.execute('DELETE FROM sessions WHERE created_at<?',(int(time.time())-86400,))
  db.close()
 
@@ -112,31 +131,45 @@ def round_state(db):
          'server_epoch':int(time.time()),'active_challenges':db.execute('SELECT COUNT(*) n FROM round_challenges WHERE round_id=?',(active['id'],)).fetchone()['n'] if active else 0}
 
 def rankings(db):
- # One login per registered team, including migrated pre-existing participants.
+ # A hint purchase is a permanent team-level ledger debit, even before a solve.
+ # Preserve all existing solve points and store the paid price at unlock time.
  rows=db.execute('''SELECT u.id,COALESCE(t.name,u.username) AS team,COALESCE(t.members_json,'[]') AS members,
- COALESCE(SUM(c.points),0) AS score,COUNT(s.id) AS solves,MAX(s.created_at) AS last_solve
+ COALESCE((SELECT SUM(c.points) FROM solves s JOIN challenges c ON c.id=s.challenge_id WHERE s.user_id=u.id),0) AS earned,
+ COALESCE((SELECT SUM(h.cost_paid) FROM hint_unlocks h WHERE h.user_id=u.id),0) AS hint_penalty,
+ (SELECT COUNT(*) FROM hint_unlocks h WHERE h.user_id=u.id) AS hints_used,
+ (SELECT COUNT(*) FROM solves s WHERE s.user_id=u.id) AS solves,
+ (SELECT MAX(created_at) FROM solves s WHERE s.user_id=u.id) AS last_solve
  FROM users u LEFT JOIN teams t ON t.login_user_id=u.id
- LEFT JOIN solves s ON s.user_id=u.id LEFT JOIN challenges c ON c.id=s.challenge_id
- WHERE u.is_admin=0 AND u.is_suspended=0 GROUP BY u.id
- ORDER BY score DESC,CASE WHEN last_solve IS NULL THEN 1 ELSE 0 END,last_solve ASC,team COLLATE NOCASE ASC''').fetchall()
- return [dict(rank=i+1,team=r['team'],username=r['team'],members=len(json.loads(r['members'])),
-              score=r['score'],solves=r['solves']) for i,r in enumerate(rows)]
+ WHERE u.is_admin=0 AND u.is_suspended=0''').fetchall()
+ teams=[dict(team=r['team'],username=r['team'],members=len(json.loads(r['members'])),
+             score=r['earned']-r['hint_penalty'],earned=r['earned'],hint_penalty=r['hint_penalty'],
+             hints_used=r['hints_used'],solves=r['solves'],last_solve=r['last_solve']) for r in rows]
+ teams.sort(key=lambda r:(-r['score'],r['last_solve'] is None,r['last_solve'] or '',r['team'].casefold()))
+ for i,r in enumerate(teams):r['rank']=i+1;r.pop('last_solve')
+ return teams
 
 def score_history(db,top=5):
  leaders=rankings(db)[:top]
  baseline=db.execute('SELECT MIN(start_epoch) AS v FROM rounds').fetchone()['v'] or int(time.time())
  scores=[]
  for team in leaders:
-  events=db.execute('''SELECT s.created_at,c.points FROM solves s JOIN users u ON u.id=s.user_id
- LEFT JOIN teams t ON t.login_user_id=u.id JOIN challenges c ON c.id=s.challenge_id
- WHERE COALESCE(t.name,u.username)=? ORDER BY s.created_at,s.id''',(team['team'],)).fetchall()
-  points=[{'at':baseline,'score':0}];acc=0
-  for e in events:
-   acc+=e['points']
-   at=int(datetime.fromisoformat(e['created_at'].replace('Z','+00:00')).timestamp())
-   points.append({'at':at,'score':acc})
+  u=db.execute('SELECT login_user_id FROM teams WHERE name=? COLLATE NOCASE',(team['team'],)).fetchone()
+  if not u:continue
+  uid=u['login_user_id']
+  earned=db.execute('''SELECT s.created_at AS created_at,s.id AS uid,c.points AS delta FROM solves s
+       JOIN challenges c ON c.id=s.challenge_id WHERE s.user_id=?''',(uid,)).fetchall()
+  hints=db.execute('''SELECT h.created_at AS created_at,h.hint_index AS uid,-h.cost_paid AS delta FROM hint_unlocks h
+       WHERE h.user_id=?''',(uid,)).fetchall()
+  events=[]
+  for e in list(earned)+list(hints):
+   epoch=datetime.fromisoformat(e['created_at'].replace('Z','+00:00')).timestamp()
+   events.append((epoch,e['delta']))
+  events.sort(key=lambda e:e[0]);points=[{'at':baseline,'score':0}];acc=0
+  for at,delta in events:
+   acc+=delta;points.append({'at':int(at),'score':acc})
   scores.append({'team':team['team'],'points':points})
  return scores
+
 
 def page(title,body,user=None,message='',status='',extra_script=''):
  nav=('<a href="/challenges">Challenges</a><a href="/scoreboard">Leaderboard</a>')
@@ -157,7 +190,7 @@ def tag(name):return f'<span class="tag">{esc(name)}</span>'
 def ts_cell(s):return esc(str(s).replace('T',' ').replace('Z',' UTC'))
 
 class Handler(BaseHTTPRequestHandler):
- server_version='CryptoHunt/2.0'
+ server_version='CryptoHunt/3.0'
  def log_message(self,fmt,*args):sys.stderr.write(f'{self.address_string()} - {fmt%args}\n')
  def do_GET(self):self.run('GET')
  def do_POST(self):self.run('POST')
@@ -247,6 +280,7 @@ class Handler(BaseHTTPRequestHandler):
    parts=p.strip('/').split('/')
    if len(parts)==2 and parts[1].isdigit() and method=='GET':return self.challenge(int(parts[1]))
    if len(parts)==3 and parts[1].isdigit() and parts[2]=='submit' and method=='POST':return self.submit(int(parts[1]),form)
+   if len(parts)==3 and parts[1].isdigit() and parts[2]=='hint' and method=='POST':return self.unlock_hint(int(parts[1]),form)
   if p.startswith('/asset/') and method=='GET':return self.asset(p)
   if p=='/admin' and method=='GET':return self.admin()
   if p=='/api/admin' and method=='GET':return self.api_admin()
@@ -268,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
   n=self.db.execute('SELECT COUNT(*) c FROM teams').fetchone()['c']
   live=bool(active_round(self.db));total=self.db.execute('SELECT COUNT(*) c FROM challenges').fetchone()['c']
   status='<span class="live-indicator">● EVENT LIVE</span>' if live else '<span class="offline-indicator">● AWAITING LAUNCH</span>'
-  body=f'''<section class="hero"><div class="eyebrow">CAMPUS SECURITY COMPETITION · 2026</div>{status}<h1>FIND THE SIGNAL.<br><em>OWN THE HUNT.</em></h1><p>Find what others overlook. Extract the hidden. Decode the impossible. Earn your place on the live leaderboard. AI tools are allowed—evidence is mandatory.</p><div class="actions"><a class="button" href="/challenges">Explore challenges <b>↗</b></a><a class="button ghost" href="/scoreboard">View live rankings</a></div>{card_stats([('Challenge slots',total),('Registered teams',n),('Competition mode','Teams')])}</section><div class="section-title"><span class="eyebrow">THREE DOMAINS · ONE FINAL HUNT</span><h2>Your playground</h2></div><section class="domains"><article><div class="domain-icon">◈</div><h3>Steganography</h3><p>Images, audio and unexpected places. Discover what is hiding underneath.</p><strong>09 CHALLENGES</strong></article><article><div class="domain-icon">⌘</div><h3>Cryptography</h3><p>Break down layered encodings and reconstruct the messages that matter.</p><strong>07 CHALLENGES</strong></article><article><div class="domain-icon">⌁</div><h3>Web Security</h3><p>Inspect an isolated puzzle application and uncover its hidden behavior.</p><strong>03 CHALLENGES</strong></article></section><p class="footnote">Final challenge: a multi-stage Cyber Hunt combining the disciplines.</p>'''
+  body=f'''<section class="hero"><div class="eyebrow">CAMPUS SECURITY COMPETITION · 2026</div>{status}<h1>FIND THE SIGNAL.<br><em>OWN THE HUNT.</em></h1><p>One mission board. Every challenge in one place. Work together, unlock clues strategically, and climb the live leaderboard. AI tools are permitted.</p><div class="actions"><a class="button" href="/challenges">Enter the mission board ↗</a><a class="button ghost" href="/scoreboard">Live team rankings</a></div>{card_stats([('Total missions',total),('Registered teams',n),('Competition mode','Team hunt')])}</section><section class="panel unified-intro"><div class="eyebrow">ONE ARENA · MULTIPLE SKILLS</div><h2>One hunt. One scoreboard.</h2><p>All released challenges appear together, without separate category pages. Your team can attempt the missions in any order during the active round. A paid clue reduces the team score immediately.</p></section>'''
   body+='<div class="notice">'+esc(setting(self.db,'announcement'))+'</div>'
   return self.html(200,'Home',body)
  def auth(self,mode,form):
@@ -331,29 +365,55 @@ class Handler(BaseHTTPRequestHandler):
   items=(self.db.execute('''SELECT c.* FROM challenges c JOIN round_challenges rc ON rc.challenge_id=c.id
        WHERE rc.round_id=? AND c.published=1 ORDER BY c.sort_order,c.id''',(current['id'],)).fetchall()
          if current else [])
-  if self.user['is_admin']:
-   items=self.db.execute('SELECT * FROM challenges ORDER BY sort_order,id').fetchall()
+  if self.user['is_admin']:items=self.db.execute('SELECT * FROM challenges ORDER BY sort_order,id').fetchall()
+  # Mix challenge types in a single continuous board, without category tabs.
+  groups={};order=[]
+  for c in items:
+   key=c['category']
+   if key not in groups:groups[key]=[];order.append(key)
+   groups[key].append(c)
+  mixed=[]
+  while any(groups.values()):
+   for key in order:
+    if groups[key]:mixed.append(groups[key].pop(0))
   solved={r['challenge_id'] for r in self.db.execute('SELECT challenge_id FROM solves WHERE user_id=?',(self.user['user_id'],))}
-  filt=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('category',[''])[0]
-  tabs=''.join(f'<a href="/challenges?category={urllib.parse.quote(c)}" class="filter {"active" if filt==c else ""}">{esc(c)}</a>' for c in CATEGORIES)
-  tiles=''.join(f'<a href="/challenge/{c["id"]}" class="challenge-card {"done" if c["id"] in solved else ""}"><div class="flex-between">{tag(c["category"])}<span class="points">{c["points"]} PTS</span></div><h3>{esc(c["title"])}</h3><p>{esc(c["description"][:145])}{"…" if len(c["description"])>145 else ""}</p><div class="challenge-bottom">{"✓ COMPLETED" if c["id"] in solved else "OPEN CHALLENGE ↗"}</div></a>' for c in items if not filt or c['category']==filt)
-  intro=f'<div class="page-heading"><div><span class="eyebrow">MISSION DIRECTORY</span><h1>Challenge arena</h1><p>Collaborate as a team. Submit one flag per challenge.</p></div><span class="counter">{len(solved)} SOLVES · {len(items)} IN THIS ROUND</span></div>'
-  if not current and not self.user['is_admin']:intro+='<div class="notice">No active round. The organizer will deploy the next mission set; submissions are locked until then.</div>'
-  elif current:intro+=f'<div class="round-hero"><div class="eyebrow">ACTIVE MISSION WINDOW</div><h2>{esc(current["title"])}</h2><p>{len(items)} challenges deployed · {current["duration_minutes"]} minute window. Countdown is synchronized with the server.</p></div>'
-  intro+=f'<div class="filters"><a class="filter {"active" if not filt else ""}" href="/challenges">All missions</a>{tabs}</div><div class="challenge-grid">{tiles or "<p class=muted>No challenges released in this view.</p>"}</div>'
+  penalties={r['challenge_id']:r['paid'] for r in self.db.execute('SELECT challenge_id,SUM(cost_paid) paid FROM hint_unlocks WHERE user_id=? GROUP BY challenge_id',(self.user['user_id'],))}
+  tiles=''.join(f'<a href="/challenge/{c["id"]}" class="challenge-card {"done" if c["id"] in solved else ""}"><div class="flex-between"><span class="tag">MISSION {i:02}</span><span class="points">{c["points"]} PTS</span></div><h3>{esc(c["title"])}</h3><p>{esc(c["description"][:145])}{"…" if len(c["description"])>145 else ""}</p><div class="challenge-bottom">{"✓ COMPLETED" if c["id"] in solved else "OPEN MISSION ↗"}{f" · −{penalties[c['id']]} hint pts" if penalties.get(c["id"]) else ""}</div></a>' for i,c in enumerate(mixed,1))
+  intro=f'<div class="page-heading"><div><span class="eyebrow">UNIFIED MISSION BOARD</span><h1>Challenges</h1><p>All skills, one arena. Solve in any order; hints cost team points.</p></div><span class="counter">{len(solved)} SOLVED · {len(items)} AVAILABLE</span></div>'
+  if not current and not self.user['is_admin']:intro+='<div class="notice">No active round. The organizer will deploy the next mission set; submissions and hint purchases are locked until then.</div>'
+  elif current:intro+=f'<div class="round-hero"><div class="eyebrow">ACTIVE MISSION WINDOW</div><h2>{esc(current["title"])}</h2><p>{len(items)} missions deployed · {current["duration_minutes"]} minutes. Countdown is synchronized with the server.</p></div>'
+  intro+=f'<div class="challenge-grid">{tiles or "<p class=muted>No challenges released at the moment.</p>"}</div>'
   return self.html(200,'Challenges',intro)
  def challenge(self,cid):
   if not self.require_auth():return
   c=self.db.execute('SELECT * FROM challenges WHERE id=?',(cid,)).fetchone()
   if not self.challenge_access(c):return self.error('This challenge is unavailable.',404)
   solved=self.db.execute('SELECT 1 FROM solves WHERE challenge_id=? AND user_id=?',(cid,self.user['user_id'])).fetchone() is not None
-  h='<div class="hint"><strong>HINT</strong><p>'+esc(c['hint'])+'</p></div>' if c['hint'] else ''
+  hints=self.db.execute('SELECT * FROM challenge_hints WHERE challenge_id=? ORDER BY hint_index',(cid,)).fetchall()
+  unlocked={r['hint_index']:r['cost_paid'] for r in self.db.execute('SELECT hint_index,cost_paid FROM hint_unlocks WHERE user_id=? AND challenge_id=?',(self.user['user_id'],cid))}
+  paid=sum(unlocked.values())
+  panel=[]
+  for hint in hints:
+   idx=hint['hint_index'];cost=hint['cost'];owned=idx in unlocked
+   if self.user['is_admin']:
+    item=f'<div class="hint-content"><span class="hint-status">ORGANIZER PREVIEW · {cost} PTS</span><p>{esc(hint["body"])}</p></div>'
+   elif owned:
+    item=f'<div class="hint-content"><span class="hint-status">UNLOCKED · {unlocked[idx]} PTS SPENT</span><p>{esc(hint["body"])}</p></div>'
+   elif solved:
+    item='<p class="muted">No further hints can be purchased after solving.</p>'
+   elif any(previous not in unlocked for previous in range(1,idx)):
+    item='<p class="muted">Unlock the previous hint first.</p>'
+   else:
+    button='Unlock free hint' if cost==0 else f'Unlock for −{cost} points'
+    item=csrf_form(f'/challenge/{cid}/hint','<input type="hidden" name="hint_index" value="'+str(idx)+'">',button,'hint-unlock-form')
+   panel.append(f'<div class="clue-entry"><div class="flex-between"><strong>CLUE {idx:02}</strong><span class="clue-cost">{("FREE" if cost==0 else f"−{cost} PTS")}</span></div>{item}</div>')
+  clue_block=(f'<section class="clue-panel"><div class="flex-between"><div><div class="eyebrow">OPTIONAL ASSISTANCE</div><h2>Clue vault</h2></div><span class="hint-total">{len(unlocked)}/{len(hints)} unlocked · −{paid} pts</span></div><p class="muted">Clues are unlocked for the entire team. Costs are charged immediately, only once, and cannot be refunded. Unlock in order.</p>{"".join(panel)}</section>' if hints else '')
   files=f'<a class="button ghost" href="/asset/{cid}/{urllib.parse.quote(c["asset_name"])}">↓ Download evidence</a>' if c['asset_name'] else ''
   result=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('result',[''])[0]
   feedback='<div class="notice error">Incorrect flag. Check the evidence and try again.</div>' if result=='wrong' else ''
-  submit=f'<div class="notice success">✓ Flag accepted. Points credited to your team.</div>' if solved else feedback+csrf_form(f'/challenge/{cid}/submit',inp('flag','Flag submission',extra='autocomplete="off" maxlength="200" required placeholder="HUNT{...}"'),'Verify flag')
+  submit=f'<div class="notice success">✓ Flag accepted. Points credited to your team; unlocked clue costs remain deducted.</div>' if solved else feedback+csrf_form(f'/challenge/{cid}/submit',inp('flag','Flag submission',extra='autocomplete="off" maxlength="200" required placeholder="HUNT{...}"'),'Verify flag')
   if self.user['is_admin']:submit='<p class="muted">Organizer preview: flag submission disabled for admins.</p>'
-  body=f'<a class="back" href="/challenges">← ALL CHALLENGES</a><section class="mission panel"><div class="flex-between">{tag(c["category"])}<span class="points">{c["points"]} POINTS</span></div><h1>{esc(c["title"])}</h1><div class="prose">{esc(c["description"])}</div>{files}{h}<div class="divider"></div>{submit}</section>'
+  body=f'<a class="back" href="/challenges">← ALL MISSIONS</a><section class="mission panel"><div class="flex-between"><span class="tag">ACTIVE MISSION</span><span class="points">{c["points"]} POINTS</span></div><h1>{esc(c["title"])}</h1><div class="prose">{esc(c["description"])}</div>{files}{clue_block}<div class="divider"></div>{submit}</section>'
   return self.html(200,c['title'],body)
  def asset(self,path):
   if not self.require_auth():return
@@ -366,6 +426,34 @@ class Handler(BaseHTTPRequestHandler):
   if fp.stat().st_size>8_000_000:return self.error('Asset too large.',413)
   ctype=mimetypes.guess_type(fp.name)[0] or 'application/octet-stream'
   return self.respond(200,fp.read_bytes(),ctype,extra={'Content-Disposition':f'attachment; filename="{fp.name}"'})
+ def unlock_hint(self,cid,form):
+  if not self.require_auth():return
+  if self.user['is_admin']:return self.error('Organizers cannot purchase hints.',403)
+  try:idx=int(form.get('hint_index','0'))
+  except ValueError:return self.error('Invalid clue index.',400)
+  if not 1<=idx<=5:return self.error('Invalid clue index.',400)
+  try:
+   self.db.execute('BEGIN IMMEDIATE')
+   if not active_round(self.db):
+    self.db.execute('ROLLBACK');return self.error('The round has expired. Hint unlocking is closed.',403)
+   c=self.db.execute('SELECT id,published FROM challenges WHERE id=?',(cid,)).fetchone()
+   if not c or not c['published'] or not round_has_challenge(self.db,cid):
+    self.db.execute('ROLLBACK');return self.error('Challenge unavailable in this round.',404)
+   if self.db.execute('SELECT 1 FROM hint_unlocks WHERE user_id=? AND challenge_id=? AND hint_index=?',(self.user['user_id'],cid,idx)).fetchone():
+    self.db.execute('COMMIT');return self.go(f'/challenge/{cid}')
+   if self.db.execute('SELECT 1 FROM solves WHERE user_id=? AND challenge_id=?',(self.user['user_id'],cid)).fetchone():
+    self.db.execute('ROLLBACK');return self.error('Solved missions do not allow new clue purchases.',409)
+   hint=self.db.execute('SELECT cost FROM challenge_hints WHERE challenge_id=? AND hint_index=?',(cid,idx)).fetchone()
+   if not hint:
+    self.db.execute('ROLLBACK');return self.error('Clue not available.',404)
+   if idx>1 and not self.db.execute('SELECT 1 FROM hint_unlocks WHERE user_id=? AND challenge_id=? AND hint_index=?',(self.user['user_id'],cid,idx-1)).fetchone():
+    self.db.execute('ROLLBACK');return self.error('Unlock earlier clues before this one.',409)
+   self.db.execute('INSERT INTO hint_unlocks(user_id,challenge_id,hint_index,cost_paid,created_at,created_epoch) VALUES (?,?,?,?,?,?)',(self.user['user_id'],cid,idx,hint['cost'],now(),int(time.time())))
+   self.db.execute('COMMIT')
+  except Exception:
+   if self.db.in_transaction:self.db.execute('ROLLBACK')
+   raise
+  return self.go(f'/challenge/{cid}')
  def submit(self,cid,form):
   if not self.require_auth():return
   if self.user['is_admin']:return self.error('Admins do not submit flags.',403)
@@ -410,6 +498,7 @@ class Handler(BaseHTTPRequestHandler):
   c=self.db.execute('SELECT COUNT(*) c FROM challenges').fetchone()['c']
   s=self.db.execute('SELECT COUNT(*) c FROM solves').fetchone()['c']
   subs=self.db.execute('SELECT COUNT(*) c FROM submissions').fetchone()['c']
+  hints_total=self.db.execute('SELECT COUNT(*) c FROM hint_unlocks').fetchone()['c']
   challenges=self.db.execute('SELECT * FROM challenges ORDER BY sort_order,id').fetchall()
   rounds=self.db.execute('SELECT r.*,COUNT(rc.challenge_id) AS n FROM rounds r LEFT JOIN round_challenges rc ON r.id=rc.round_id GROUP BY r.id ORDER BY r.id DESC LIMIT 12').fetchall()
   current=active_round(self.db)
@@ -426,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
   teams=self.db.execute('SELECT t.id,t.name,t.members_json,u.username FROM teams t JOIN users u ON u.id=t.login_user_id ORDER BY t.id DESC LIMIT 120').fetchall()
   teamrows=''.join(f'<tr><td><strong>{esc(t["name"])}</strong></td><td>{esc(", ".join(json.loads(t["members_json"])))}</td><td>{esc(t["username"])}</td><td><a class="small-button" href="/admin/team/{t["id"]}/edit">Edit roster</a></td></tr>' for t in teams)
   body=f'''<div class="page-heading"><div><span class="eyebrow">ORGANIZER ACCESS ONLY</span><h1>Mission control</h1><p>Launch timed rounds. Choose any challenge set at deployment.</p></div><div class="header-actions"><a class="button" href="/admin/challenge/new">+ Create challenge</a><a class="button ghost" href="/admin/export.csv">Export scores CSV</a></div></div>
-  {card_stats([('Registered teams',u),('Registered members',roster),('Challenges',c),('Verified solves',s),('Flag attempts',subs)])}
+  {card_stats([('Registered teams',u),('Registered members',roster),('Challenges',c),('Verified solves',s),('Hints unlocked',hints_total),('Flag attempts',subs)])}
   <section class="panel round-control"><div class="flex-between"><div><span class="eyebrow">LIVE ROUND DEPLOYMENT</span><h2>Release control</h2></div><span class="muted">TIME ENFORCED ON SERVER</span></div>{roundpanel}{deploy}</section>
   <section class="admin-columns"><div class="panel"><h2>Event settings</h2>{settings}</div><div class="panel"><h2>Live submission feed <span class="online">● LIVE</span></h2><div id="admin-metrics">Loading live data…</div><div id="admin-feed" class="feed"></div></div></section>
   <section class="panel tablepanel"><h2>Round history</h2><table><thead><tr><th>ROUND</th><th>CHALLENGES</th><th>DURATION</th><th>STATUS</th></tr></thead><tbody>{history or '<tr><td colspan="4">No rounds yet.</td></tr>'}</tbody></table></section>
@@ -435,12 +524,18 @@ class Handler(BaseHTTPRequestHandler):
   return self.html(200,'Mission control',body)
  def api_admin(self):
   if not self.require_auth(admin=True):return
-  recent=self.db.execute('''SELECT COALESCE(t.name,u.username) AS team,c.title,s.correct,s.created_at
-       FROM submissions s JOIN users u ON s.user_id=u.id LEFT JOIN teams t ON t.login_user_id=u.id
-       JOIN challenges c ON s.challenge_id=c.id ORDER BY s.id DESC LIMIT 25''').fetchall()
+  recent=self.db.execute('''SELECT team,title,kind,correct,created_at,cost FROM (
+    SELECT COALESCE(t.name,u.username) AS team,c.title AS title,'flag' AS kind,s.correct AS correct,s.created_at AS created_at,0 AS cost,s.created_epoch AS ts,s.id AS seq
+    FROM submissions s JOIN users u ON s.user_id=u.id LEFT JOIN teams t ON t.login_user_id=u.id JOIN challenges c ON s.challenge_id=c.id
+    UNION ALL
+    SELECT COALESCE(t.name,u.username),c.title,'hint' AS kind,NULL,h.created_at,h.cost_paid,h.created_epoch,h.rowid
+    FROM hint_unlocks h JOIN users u ON h.user_id=u.id LEFT JOIN teams t ON t.login_user_id=u.id JOIN challenges c ON h.challenge_id=c.id
+    ) ORDER BY ts DESC,seq DESC LIMIT 30''').fetchall()
   data={'teams':self.db.execute('SELECT COUNT(*) c FROM teams').fetchone()['c'],
         'members':self.db.execute('SELECT COALESCE(SUM(json_array_length(members_json)),0) n FROM teams').fetchone()['n'],
         'solves':self.db.execute('SELECT COUNT(*) c FROM solves').fetchone()['c'],
+        'hints_unlocked':self.db.execute('SELECT COUNT(*) c FROM hint_unlocks').fetchone()['c'],
+        'points_spent':self.db.execute('SELECT COALESCE(SUM(cost_paid),0) c FROM hint_unlocks').fetchone()['c'],
         'attempts':self.db.execute('SELECT COUNT(*) c FROM submissions').fetchone()['c'],
         'round':round_state(self.db),'recent':[dict(x) for x in recent]}
   return self.respond(200,json.dumps(data),'application/json')
@@ -514,8 +609,27 @@ class Handler(BaseHTTPRequestHandler):
   def v(k,default=''):return c[k] if c else default
   options=''.join(f'<option value="{esc(x)}" {"selected" if v("category")==x else ""}>{esc(x)}</option>' for x in CATEGORIES)
   options2=''.join(f'<option value="{x}" {"selected" if v("flag_mode","static")==x else ""}>{x}</option>' for x in ('static','dynamic'))
-  body=f'''<a class="back" href="/admin">← MISSION CONTROL</a><section class="panel editor"><div class="eyebrow">CHALLENGE CONFIGURATION</div><h1>{"Edit challenge" if cid else "New challenge"}</h1>{csrf_form('/admin/challenge/'+str(cid)+'/edit' if cid else '/admin/challenge/new',inp('slug','Unique slug',v('slug'),extra='required pattern="[a-z0-9-]{3,65}"')+inp('title','Title',v('title'),extra='required maxlength="120"')+'<label>Category<select name="category">'+options+'</select></label>'+txt('description','Instructions',v('description'),6)+inp('hint','Optional hint',v('hint'),extra='maxlength="500"')+inp('points','Points',v('points',100),'number','min="50" max="2000" required')+inp('sort_order','Display order',v('sort_order',1),'number')+'<label>Flag mode<select name="flag_mode">'+options2+'</select></label>'+inp('flag','Static flag (blank keeps existing)',type_='password',extra='' if cid else 'placeholder="HUNT{...}"')+inp('asset_name','Evidence file stored on server (upload below)',v('asset_name'),extra='id="asset_name" readonly')+'<div class="upload-tool"><label>Upload new evidence (PNG, JPG, WAV, MP3, TXT, ZIP, PDF, BIN; max 3 MB)<input type="file" id="upload-file" accept=".png,.jpg,.jpeg,.wav,.mp3,.txt,.zip,.pdf,.bin"></label><button type="button" id="upload-button" class="button ghost">Upload file</button><p id="upload-status" class="muted" role="status">Upload first, then save the challenge.</p></div><label class="toggle"><input type="checkbox" name="published" '+('checked' if v('published',0) else '')+'><span>Enabled in catalog (release still requires round deployment)</span></label>','Save challenge')}</section>'''
-  return self.html(200,'Challenge editor',body,'<script src="/static/app.js" defer></script>')
+  previous={h['hint_index']:h for h in self.db.execute('SELECT * FROM challenge_hints WHERE challenge_id=? ORDER BY hint_index',(cid,)).fetchall()} if cid else {}
+  hints='<section class="clue-editor"><h2>Multiple hints and score deductions</h2><p class="muted">Up to five sequential clues. The first is free by default; paid clues debit the team immediately. Prices are fixed when purchased. Leave text blank to remove an unused clue.</p>'
+  for i in range(1,6):
+   existing=previous.get(i)
+   hint_text=existing['body'] if existing else (v('hint') if i==1 else '')
+   hint_cost=existing['cost'] if existing else (0 if i==1 else 10 if i==2 else 20)
+   hints+=f'<div class="hint-edit-row"><div class="eyebrow">CLUE {i:02}</div>'+txt(f'hint_{i}','Clue text',hint_text,2)+inp(f'hint_cost_{i}','Cost (team points)',hint_cost,'number','min="0" max="500" required')+'</div>'
+  hints+='</section>'
+  fields=(inp('slug','Unique slug',v('slug'),extra='required pattern="[a-z0-9-]{3,65}"')+
+          inp('title','Title',v('title'),extra='required maxlength="120"')+
+          '<label>Organizer category <small>(not shown as a separate student section)</small><select name="category">'+options+'</select></label>'+
+          txt('description','Instructions',v('description'),6)+hints+
+          inp('points','Base points',v('points',100),'number','min="50" max="2000" required')+
+          inp('sort_order','Display order',v('sort_order',1),'number')+
+          '<label>Flag mode<select name="flag_mode">'+options2+'</select></label>'+
+          inp('flag','Static flag (blank keeps existing)',type_='password',extra='' if cid else 'placeholder="HUNT{...}"')+
+          inp('asset_name','Evidence file stored on server (upload below)',v('asset_name'),extra='id="asset_name" readonly')+
+          '<div class="upload-tool"><label>Upload new evidence (PNG, JPG, WAV, MP3, TXT, ZIP, PDF, BIN; max 3 MB)<input type="file" id="upload-file" accept=".png,.jpg,.jpeg,.wav,.mp3,.txt,.zip,.pdf,.bin"></label><button type="button" id="upload-button" class="button ghost">Upload file</button><p id="upload-status" class="muted" role="status">Upload first, then save the challenge.</p></div>'+
+          '<label class="toggle"><input type="checkbox" name="published" '+('checked' if v('published',0) else '')+'><span>Enabled in catalog (release still requires round deployment)</span></label>')
+  body=f'<a class="back" href="/admin">← MISSION CONTROL</a><section class="panel editor"><div class="eyebrow">MISSION CONFIGURATION</div><h1>{"Edit challenge" if cid else "New challenge"}</h1>'+csrf_form('/admin/challenge/'+str(cid)+'/edit' if cid else '/admin/challenge/new',fields,'Save challenge')+'</section>'
+  return self.html(200,'Challenge editor',body)
  def upload_asset(self):
   if not self.require_auth(admin=True):return
   if self.headers.get('Content-Type','').split(';')[0].strip()!='application/json':return self.error('Expected JSON.',415)
@@ -550,18 +664,43 @@ class Handler(BaseHTTPRequestHandler):
   if mode=='static' and not digest:return self.error('A static challenge requires a flag.')
   asset=form.get('asset_name','')
   if asset and (Path(asset).name!=asset or not (ASSETS/asset).is_file()):return self.error('The artifact must already exist in the data/artifacts directory.')
-  vals=(slug,title,cat,desc,points,digest,mode,int(form.get('published')=='on'),sort,form.get('hint','')[:500],asset)
+  hints=[];gap=False;cost_total=0
+  for idx in range(1,6):
+   text=form.get(f'hint_{idx}','').strip()
+   try:cost=int(form.get(f'hint_cost_{idx}','0'))
+   except ValueError:return self.error('Hint prices must be integers.')
+   if cost<0 or cost>500 or len(text)>650:return self.error('Hint prices must be 0–500 and clue text under 650 characters.')
+   if not text:gap=True;continue
+   if gap:return self.error('Hints must be consecutive, starting at clue 1.')
+   hints.append((idx,text,cost));cost_total+=cost
+  if cost_total>points:return self.error('Combined hint costs cannot exceed the challenge base points.')
+  vals=(slug,title,cat,desc,points,digest,mode,int(form.get('published')=='on'),sort,'',asset)
   try:
+   self.db.execute('BEGIN IMMEDIATE')
    if cid:self.db.execute('UPDATE challenges SET slug=?,title=?,category=?,description=?,points=?,flag_hash=?,flag_mode=?,published=?,sort_order=?,hint=?,asset_name=? WHERE id=?',vals+(cid,))
-   else:self.db.execute('INSERT INTO challenges(slug,title,category,description,points,flag_hash,flag_mode,published,sort_order,hint,asset_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)',vals)
-  except sqlite3.IntegrityError:return self.error('Slug is already in use.')
+   else:
+    cursor=self.db.execute('INSERT INTO challenges(slug,title,category,description,points,flag_hash,flag_mode,published,sort_order,hint,asset_name) VALUES (?,?,?,?,?,?,?,?,?,?,?)',vals)
+    cid=cursor.lastrowid
+   # Preserve already-unlocked clue definitions, so existing purchases never become unusable.
+   unlocked={r['hint_index'] for r in self.db.execute('SELECT DISTINCT hint_index FROM hint_unlocks WHERE challenge_id=?',(cid,))}
+   if any(idx not in [h[0] for h in hints] for idx in unlocked):
+    self.db.execute('ROLLBACK');return self.error('Cannot remove a clue already purchased by a team. Edit its text or price instead.',409)
+   self.db.execute('DELETE FROM challenge_hints WHERE challenge_id=?',(cid,))
+   self.db.executemany('INSERT INTO challenge_hints(challenge_id,hint_index,body,cost) VALUES (?,?,?,?)',[(cid,*h) for h in hints])
+   self.db.execute('COMMIT')
+  except sqlite3.IntegrityError:
+   if self.db.in_transaction:self.db.execute('ROLLBACK')
+   return self.error('Slug is already in use.')
+  except Exception:
+   if self.db.in_transaction:self.db.execute('ROLLBACK')
+   raise
   return self.go('/admin')
  def toggle(self,cid):
   if not self.require_auth(admin=True):return
   self.db.execute('UPDATE challenges SET published=1-published WHERE id=?',(cid,));return self.go('/admin')
  def export(self):
   if not self.require_auth(admin=True):return
-  output=io.StringIO();w=csv.writer(output);w.writerow(['rank','team','members','points','solves']);w.writerows([r['rank'],r['team'],r['members'],r['score'],r['solves']] for r in rankings(self.db))
+  output=io.StringIO();w=csv.writer(output);w.writerow(['rank','team','members','net_points','earned_points','hint_deductions','hints_unlocked','solves']);w.writerows([r['rank'],r['team'],r['members'],r['score'],r['earned'],r['hint_penalty'],r['hints_used'],r['solves']] for r in rankings(self.db))
   return self.respond(200,output.getvalue(),'text/csv; charset=utf-8',extra={'Content-Disposition':'attachment; filename="crypto-hunt-scores.csv"'})
  def arena(self,p,q):
   if not self.require_auth():return

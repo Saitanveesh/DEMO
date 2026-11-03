@@ -38,11 +38,12 @@ function drawGraph(history){
  const all=(history||[]).flatMap(s=>s.points||[]);const w=900,h=290,left=68,right=22,top=24,bottom=43;
  const lo=Math.min(...all.map(x=>x.at),Date.now()/1000),hi=Math.max(...all.map(x=>x.at),Date.now()/1000);
  const minX=Number.isFinite(lo)?lo-10:0,maxX=Number.isFinite(hi)?Math.max(hi,minX+60):60;
- const ymax=Math.max(100,...all.map(x=>x.score||0));const ceiling=Math.ceil(ymax/100)*100;
- const x=t=>left+((t-minX)/Math.max(1,maxX-minX))*(w-left-right), y=v=>h-bottom-(v/ceiling)*(h-top-bottom);
+ const ymax=Math.max(50,...all.map(x=>x.score||0));const ymin=Math.min(0,...all.map(x=>x.score||0));
+ const ceiling=Math.ceil(ymax/50)*50, floor=Math.floor(ymin/50)*50;
+ const x=t=>left+((t-minX)/Math.max(1,maxX-minX))*(w-left-right), y=v=>h-bottom-((v-floor)/Math.max(1,ceiling-floor))*(h-top-bottom);
  svg.append(svgEl('rect',{x:0,y:0,width:w,height:h,fill:'transparent'}));
  for(let i=0;i<=4;i++){
-  const score=ceiling*i/4,yp=y(score);
+  const score=floor+(ceiling-floor)*i/4,yp=y(score);
   svg.append(svgEl('line',{x1:left,x2:w-right,y1:yp,y2:yp,stroke:'#314352','stroke-width':1,'stroke-dasharray':i===0?'0':'4 7',opacity:.65}));
   svg.append(svgEl('text',{x:left-13,y:yp+4,'text-anchor':'end',class:'axis-text'},Math.round(score)));
  }
@@ -64,14 +65,14 @@ function drawGraph(history){
   svg.append(svgEl('path',{d,fill:'none',stroke:color,'stroke-width':3.2,'stroke-linecap':'round','stroke-linejoin':'round'}));
   for(const [px,py] of points.slice(1,-1))svg.append(svgEl('circle',{cx:px,cy:py,r:4.2,fill:color,stroke:'#101d2a','stroke-width':2}));
  });
- if(!drew)svg.append(svgEl('text',{x:w/2,y:h/2,'text-anchor':'middle',class:'chart-empty'},'SCORE PROGRESS APPEARS AFTER FIRST SOLVE'));
+ if(!drew)svg.append(svgEl('text',{x:w/2,y:h/2,'text-anchor':'middle',class:'chart-empty'},'SCORE HISTORY APPEARS AFTER FIRST SOLVE OR PAID CLUE'));
 }
 function updatePodium(leaders){const podium=$('podium');if(!podium)return;podium.replaceChildren();
  for(const [i,p] of leaders.slice(0,3).entries()){
   const card=document.createElement('div');card.className='podium-card podium-'+(i+1);
   const rank=document.createElement('span');rank.className='podium-rank';rank.textContent=`#${i+1}`;
   const team=document.createElement('strong');team.textContent=p.team||p.username;
-  const meta=document.createElement('span');meta.textContent=`${p.members||1} MEMBERS · ${p.solves} SOLVES`;
+  const meta=document.createElement('span');meta.textContent=`${p.members||1} MEMBERS · ${p.solves} SOLVES · −${p.hint_penalty||0} HINT PTS`;
   const points=document.createElement('b');points.textContent=`${p.score} PTS`;
   card.append(rank,team,meta,points);podium.append(card);
  }
@@ -81,7 +82,7 @@ async function reloadScores(){
  try{
   const res=await fetch('/api/scoreboard',{cache:'no-store'});if(!res.ok)throw Error(res.status);
   const data=await res.json();body.replaceChildren();updatePodium(data.ranking);drawGraph(data.history);
-  data.ranking.forEach(team=>{const tr=document.createElement('tr');tr.append(cell(String(team.rank).padStart(2,'0')),cell(`${team.team||team.username} · ${team.members||1} member(s)`),cell(team.solves),cell(`${team.score} pts`));body.append(tr);});
+  data.ranking.forEach(team=>{const tr=document.createElement('tr');tr.append(cell(String(team.rank).padStart(2,'0')),cell(`${team.team||team.username} · ${team.members||1} member(s)`),cell(`${team.solves} · ${team.hints_used||0} clues`),cell(`${team.score} pts (−${team.hint_penalty||0} clues)`));body.append(tr);});
   if(!data.ranking.length){const tr=document.createElement('tr');const td=cell('Team registrations will appear here.');td.colSpan=4;tr.append(td);body.append(tr);}
   indicator.textContent=(data.frozen?'PUBLIC LEADERBOARD FROZEN · ':'SYNCED · ')+new Date(data.updated).toLocaleTimeString();
  }catch(e){indicator.textContent='Connection interrupted; reconnecting…';}
@@ -90,8 +91,8 @@ async function reloadAdmin(){
  const metrics=$('admin-metrics'),feed=$('admin-feed');if(!metrics||!feed)return;
  try{
   const res=await fetch('/api/admin',{cache:'no-store'});if(!res.ok)throw Error(res.status);const d=await res.json();
-  metrics.textContent=`${d.teams} teams · ${d.members} members · ${d.solves} solves · ${d.attempts} attempts`;
-  feed.replaceChildren();for(const s of d.recent){const row=document.createElement('div');row.className='feed-item';const desc=document.createElement('div');desc.textContent=`${s.team} · ${s.title}`;const state=document.createElement('span');state.textContent=s.correct?'SOLVED':'INCORRECT';state.className=s.correct?'ok':'bad';row.append(desc,state);feed.append(row);}
+  metrics.textContent=`${d.teams} teams · ${d.members} members · ${d.solves} solves · ${d.hints_unlocked||0} clues · −${d.points_spent||0} hint pts · ${d.attempts} attempts`;
+  feed.replaceChildren();for(const s of d.recent){const row=document.createElement('div');row.className='feed-item';const desc=document.createElement('div');desc.textContent=`${s.team} · ${s.title}`;const state=document.createElement('span');state.textContent=s.kind==='hint'?`CLUE −${s.cost} PTS`:s.correct?'SOLVED':'INCORRECT';state.className=s.kind==='hint'?'hint-event':s.correct?'ok':'bad';row.append(desc,state);feed.append(row);}
   if(!d.recent.length)feed.textContent='Waiting for the first flag submission.';
   if(d.round&&d.round.state==='expired'&&$('admin-round-countdown'))location.reload();
  }catch(e){metrics.textContent='Connection interrupted; retrying…';}
@@ -113,4 +114,12 @@ if(uploadButton)uploadButton.addEventListener('click',async()=>{
   if(!res.ok)throw Error(`Upload failed (${res.status})`);const data=await res.json();$('asset_name').value=data.asset_name;
   status.textContent=`Uploaded ${file.name} (${data.bytes} bytes). Save the challenge.`;
  }catch(e){status.textContent=String(e.message||e);}finally{uploadButton.disabled=false;}
+});
+
+// A paid clue is a permanent team-level score debit; make the confirmation explicit.
+document.querySelectorAll('form.hint-unlock-form').forEach(form=>{
+ form.addEventListener('submit',event=>{
+  const label=form.querySelector('button')?.textContent||'';
+  if(label.includes('−')&&!confirm(`${label}? This deduction affects your team's live score immediately and cannot be refunded.`))event.preventDefault();
+ });
 });

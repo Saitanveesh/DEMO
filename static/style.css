@@ -60,3 +60,24 @@ main{padding-top:40px}
 .round-strip{position:sticky;top:0;z-index:6}
 .round-strip.is-live.urgent{background:linear-gradient(115deg,rgba(81,34,44,.97),rgba(36,25,34,.98));border-color:#b66a78}
 .round-strip.urgent strong,.round-strip.urgent #round-strip-status{color:#ffc3bb}
+
+/* v3: one unified mission stream and an intentionally restrained clue vault */
+.unified-intro{max-width:850px;margin:-8px 0 28px;background:linear-gradient(125deg,rgba(20,54,59,.62),rgba(12,24,38,.93))}
+.unified-intro h2{margin:10px 0}.unified-intro p{color:#a4c0cf;max-width:700px;margin-bottom:4px}
+.challenge-card{background:linear-gradient(140deg,rgba(22,39,51,.98),rgba(12,23,36,.99));box-shadow:0 12px 30px rgba(0,0,0,.08)}
+.challenge-card:hover{box-shadow:0 17px 42px rgba(0,0,0,.22),0 0 0 1px rgba(60,233,210,.22)}
+.clue-panel{margin:32px 0 22px;background:rgba(9,22,32,.73);border:1px solid #315266;border-radius:12px;padding:22px}
+.clue-panel h2{font-size:24px;margin:8px 0}.clue-panel .muted{line-height:1.7}
+.clue-entry{border-top:1px solid #263f4e;padding:20px 0 5px}.clue-entry:first-of-type{border-top:none}
+.clue-entry strong{font-size:11px;letter-spacing:.09em;color:#d9e8ec}
+.clue-cost{font-family:ui-monospace,Consolas,monospace;color:#e9bd80;font-size:12px;font-weight:800}
+.clue-entry .button{background:transparent;color:var(--cyan);font-size:12px;border-color:#35746d;min-height:39px}
+.clue-entry .button:hover{background:rgba(60,233,210,.09)}
+.hint-content{padding:10px 0 8px}.hint-content p{margin:8px 0 3px;line-height:1.7;color:#d0e4f0}
+.hint-status{color:#86dac9;font-size:10px;font-weight:800;letter-spacing:.09em}
+.hint-total{border:1px solid #335e59;border-radius:7px;padding:7px 10px;font-size:10px;color:#92eadc;font-weight:700;white-space:nowrap}
+.clue-editor{border:1px solid #35526a;border-radius:12px;padding:22px;background:rgba(9,23,35,.65);margin:26px 0}
+.clue-editor h2{margin:4px 0 6px}.hint-edit-row{border-top:1px solid #2b3d4d;padding-top:18px;margin-top:18px}
+.hint-edit-row label{margin:12px 0}.hint-edit-row textarea{min-height:72px}
+.feed-item .hint-event{color:var(--orange)}
+@media(max-width:560px){.clue-panel,.clue-editor{padding:14px}.clue-panel .flex-between{align-items:flex-start;flex-wrap:wrap}.hint-total{white-space:normal}}

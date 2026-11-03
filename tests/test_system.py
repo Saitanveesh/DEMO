@@ -124,6 +124,77 @@ class SystemTests(unittest.TestCase):
   self.assertEqual(a.get('/admin/team/1/edit')[0],403)
   print('PASS: team registration, selective rounds, live timer, expiry, team score continuity, roster editing and dynamic flags')
 
+ def test_03_paid_hints_unified_arena_and_score_history(self):
+  admin=Client(self.port)
+  self.assertEqual(admin.post('/login',{'username':'testorganizer','password':'SuperSecureTestPassword-52836'})[0],200)
+  admin.post('/admin/rounds/end',{})
+  team=Client(self.port)
+  status,html,_=team.post('/register',{'team_name':'Hint Inspectors','members':'One\nTwo','username':'hintinspectors','password':'TestPassword_456789'})
+  self.assertEqual(status,200)
+  response=admin.post('/admin/rounds/launch',{'round_name':'Clue Trial','duration_minutes':'10','pick_10':'on','pick_11':'on'})
+  self.assertEqual(response[0],200)
+  status,page,_=team.get('/challenges');self.assertEqual(status,200)
+  self.assertIn('UNIFIED MISSION BOARD',page)
+  self.assertNotIn('/challenges?category=',page)
+  self.assertIn('Seven Steps Away',page)
+  status,page,_=team.get('/challenge/10');self.assertEqual(status,200)
+  self.assertIn('CLUE 01',page);self.assertIn('CLUE 02',page);self.assertIn('CLUE 03',page)
+  self.assertNotIn('Shift A–Z seven places backward to decrypt.',page)
+  self.assertIn('Unlock free hint',page)
+  self.assertEqual(team.post('/challenge/10/hint',{'hint_index':'3'})[0],409)
+  status,page,_=team.post('/challenge/10/hint',{'hint_index':'1'});self.assertEqual(status,200)
+  self.assertIn('Shift A–Z seven places backward to decrypt.',page)
+  board=json.loads(team.get('/api/scoreboard')[1]);me=next(r for r in board['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual((me['score'],me['hints_used'],me['hint_penalty']),(0,1,0))
+  status,page,_=team.post('/challenge/10/hint',{'hint_index':'2'});self.assertEqual(status,200)
+  me=next(r for r in json.loads(team.get('/api/scoreboard')[1])['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual((me['score'],me['hints_used'],me['hint_penalty']),(-10,2,10))
+  self.assertIn('CLUE 02',page)
+  team.post('/challenge/10/hint',{'hint_index':'2'})
+  me=next(r for r in json.loads(team.get('/api/scoreboard')[1])['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual((me['score'],me['hints_used'],me['hint_penalty']),(-10,2,10))
+  team.post('/challenge/10/hint',{'hint_index':'3'})
+  board=json.loads(team.get('/api/scoreboard')[1]);me=next(r for r in board['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual((me['score'],me['hints_used'],me['hint_penalty']),(-30,3,30))
+  graph=next(t for t in board['history'] if t['team']=='Hint Inspectors')
+  self.assertEqual(graph['points'][-1]['score'],-30)
+  monitor=json.loads(admin.get('/api/admin')[1]);self.assertGreaterEqual(monitor['hints_unlocked'],3)
+  self.assertTrue(any(x['kind']=='hint' for x in monitor['recent']))
+  status,challenge,_=admin.get('/admin/challenge/10/edit')
+  self.assertEqual(status,200);self.assertIn('hint_2',challenge);self.assertIn('hint_cost_3',challenge)
+  # Update hint 2 price, preserving the original 10-point debit already recorded.
+  original=json.loads((PACK/'manifest.json').read_text())['challenges'][9]
+  with sqlite3.connect(Path(self.dir.name)/'hunt.sqlite3') as db:
+   old_hints=db.execute('SELECT hint_index,body,cost FROM challenge_hints WHERE challenge_id=10 ORDER BY hint_index').fetchall()
+  values={'slug':original['slug'],'title':original['title'],'category':original['category'],
+          'description':original['description'],'points':str(original['points']),
+          'sort_order':'10','flag_mode':'static','asset_name':original['asset_name'],'published':'on'}
+  for idx,text,cost in old_hints:
+   values[f'hint_{idx}']=text
+   values[f'hint_cost_{idx}']=str(40 if idx==2 else cost)
+  status,_,_=admin.post('/admin/challenge/10/edit',values)
+  self.assertEqual(status,200)
+  me=next(r for r in json.loads(team.get('/api/scoreboard')[1])['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual(me['score'],-30)
+  # Correct solve grants base points but does not refund the clue charges.
+  flag=original['flag']
+  status,html,_=team.post('/challenge/10/submit',{'flag':flag})
+  self.assertEqual(status,200);self.assertIn('Points credited to your team',html)
+  me=next(r for r in json.loads(team.get('/api/scoreboard')[1])['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual((me['score'],me['earned'],me['hint_penalty'],me['solves']),(70,100,30,1))
+  self.assertEqual(team.post('/challenge/10/hint',{'hint_index':'4'})[0],409)
+  csv_text=admin.get('/admin/export.csv')[1]
+  self.assertIn('hint_deductions',csv_text);self.assertIn('Hint Inspectors',csv_text)
+  # Expiry is enforced for clue purchases as well as flags.
+  with sqlite3.connect(Path(self.dir.name)/'hunt.sqlite3') as db:
+   db.execute('UPDATE rounds SET end_epoch=? WHERE id=(SELECT MAX(id) FROM rounds)',(int(time.time())-1,))
+  self.assertEqual(team.post('/challenge/11/hint',{'hint_index':'1'})[0],403)
+  # Restart-time migrations do not replay purchases or change their original price.
+  subprocess.run([sys.executable,str(ROOT/'app.py'),'init'],env=self.env,check=True,capture_output=True)
+  me=next(r for r in json.loads(team.get('/api/scoreboard')[1])['ranking'] if r['team']=='Hint Inspectors')
+  self.assertEqual(me['score'],70)
+  print('PASS: unified arena, sequential clue unlocks, immediate point deductions, no double charge, score history and round lock')
+
  def test_02_legacy_member_migration(self):
   with tempfile.TemporaryDirectory() as directory:
    env=os.environ.copy();env['HUNT_DATA_DIR']=directory
