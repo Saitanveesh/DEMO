@@ -20,4 +20,4 @@ if __name__=='__main__':
  os.environ['HUNT_ADMIN_PASSWORD']=pw
  try:run('create-admin',username)
  finally:os.environ.pop('HUNT_ADMIN_PASSWORD',None)
- print('\nSETUP COMPLETE\nRun: python app.py serve\nOpen http://127.0.0.1:8000/admin and sign in.\n20 challenges were imported but are HIDDEN. Publish and start them from Mission control after testing.\n')
+ print('\nSETUP COMPLETE\nRun: python start_hunt.py\nUse the URL printed by the verified Windows launcher and sign in.\n20 challenges are imported but not yet released. Select them and deploy a timed round in Mission Control.\n')
